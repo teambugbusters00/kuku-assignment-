@@ -421,3 +421,17 @@ All three problem statements (PS1, PS2, PS3) are intended to call Groq for text 
 Voice preview uses Groq TTS. The backend uses the Groq Python SDK's documented `write_to_file(path)` method for the `BinaryAPIResponse`, then returns the audio bytes. It does not assume a `.content` attribute. Regression tests cover PS1/PS2/PS3 Groq wiring, PS3 no-fallback behavior, provider errors, and TTS binary response/empty response handling.
 
 **Important:** Automated tests use mocked Groq responses and do not prove the live Groq API key, model access, TTS model availability, or Render deployment is working. Check GitHub Actions and perform a live Render smoke test before claiming production readiness.
+
+
+## Top-K RAG retrieval
+
+The backend now uses lightweight BM25-style lexical retrieval before the Groq calls in PS1, PS2, and PS3:
+
+- **PS1:** selects transcript passages relevant to episode metadata extraction.
+- **PS2:** retrieves catalog entries relevant to the listener profile before generating recommendations.
+- **PS3:** retrieves passages matching continuity signals (characters, relationships, status, timeline, props, and unresolved threads) before summarizing each episode.
+- Retrieval is local Python and adds no vector database or embedding dependency.
+- The configured LLM/model context window is **not changed**. RAG limits the input evidence passed to the model; it does not expand the context window.
+- Retrieval uses a BM25-style lexical score. It is not semantic embedding search, so paraphrases with no shared terms may be missed.
+
+Configure the number of retrieved passages with `RAG_TOP_K` (default: `5`, maximum: `20`). The API response includes retrieval metadata such as selected top-K and source/retrieved character counts.
