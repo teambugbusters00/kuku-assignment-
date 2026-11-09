@@ -31,11 +31,19 @@ def _passages(text: str, max_chars: int = DEFAULT_PASSAGE_CHARS) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
-    units = text.splitlines() if "\n" in text else re.split(r"(?<=[.!?])\s+", text)
+    line_based = "\n" in text
+    units = text.splitlines() if line_based else re.split(r"(?<=[.!?])\s+", text)
     passages, current = [], ""
     for unit in units:
         unit = unit.strip()
         if not unit:
+            continue
+        if line_based:
+            while len(unit) > max_chars:
+                passages.append(unit[:max_chars].strip())
+                unit = unit[max_chars:].strip()
+            if unit:
+                passages.append(unit)
             continue
         while len(unit) > max_chars:
             if current:
