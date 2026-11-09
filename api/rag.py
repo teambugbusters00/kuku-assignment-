@@ -31,7 +31,7 @@ def _passages(text: str, max_chars: int = DEFAULT_PASSAGE_CHARS) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
-    units = re.split(r"(?<=[.!?])\s+|\n+", text)
+    units = text.splitlines() if "\n" in text else re.split(r"(?<=[.!?])\s+", text)
     passages, current = [], ""
     for unit in units:
         unit = unit.strip()
