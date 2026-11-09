@@ -2,8 +2,8 @@ from api.rag import retrieve_top_k, retrieval_stats
 
 def test_retrieval_selects_query_relevant_passage():
     text = (
-        "The heroine visits a hospital and discovers a hidden medical file. "
-        "A detective follows a suspect through the crowded market. "
+        "The heroine visits a hospital and discovers a hidden medical file.\n"
+        "A detective follows a suspect through the crowded market.\n"
         "The hospital doctor reveals that the medical file was forged."
     )
     result = retrieve_top_k(text, query="hospital doctor medical file", top_k=1)
