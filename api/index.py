@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 import os
 import json
 from groq import Groq
+from api.rag import retrieve_top_k, retrieval_stats
 
 app = FastAPI(title="StoryBridge API", version="1.0.0")
 
@@ -53,34 +54,43 @@ def ai_status():
 
 @app.post("/api/ps1/tag")
 def ps1_tag(req: TagRequest):
+    # Retrieve only the top-K relevant passages. The model context window is unchanged.
+    retrieved = retrieve_top_k(
+        req.text,
+        query=f"episode title {req.title} language {req.language} metadata genre themes characters emotions content warnings summary",
+    )
     result = groq_json(
-        "You are an audio-content metadata analyst. Extract grounded metadata from supplied episode transcript. Do not invent facts. Use concise tags.",
-        f"""Analyze this episode transcript.
+        "You are an audio-content metadata analyst. Extract grounded metadata from the retrieved transcript passages only. Do not invent facts. Use concise tags. If evidence is insufficient, say so.",
+        f"""Analyze this episode using the retrieved transcript passages.
 Title: {req.title}
 Language hint: {req.language}
-Transcript:
-{req.text}
+Retrieved passages (top-K):
+{retrieved}
 
 Return JSON with keys: title, summary (2-4 sentences), genre (array), tags (array of 5-15), themes (array), characters (array of objects with name and role_or_evidence), emotions (array), content_warnings (array), language, confidence (0-1), evidence_notes (array)."""
     )
     result["provider"] = "Groq"
     result["model"] = GROQ_MODEL
+    result["retrieval"] = retrieval_stats(req.text, retrieved)
     return result
 
 @app.post("/api/ps2/recommend")
 def ps2_recommend(req: RecommendationRequest):
+    # Each catalog line is a retrieval unit; only profile-relevant entries go to Groq.
+    retrieved_catalog = retrieve_top_k(req.catalog, query=req.user_profile)
     result = groq_json(
-        "You are a personalized audio-story recommendation engine. Recommend only items from the provided catalog. Never fabricate catalog titles or IDs. Explain relevance using profile signals.",
+        "You are a personalized audio-story recommendation engine. Recommend only items from the retrieved catalog passages. Never fabricate catalog titles or IDs. Explain relevance using profile signals. Return fewer recommendations if fewer suitable entries are retrieved.",
         f"""User/listener profile:
 {req.user_profile}
 
-Available catalog (each line may contain title, genre, synopsis, id):
-{req.catalog}
+Retrieved catalog entries (top-K only; preserve exact titles and IDs):
+{retrieved_catalog}
 
 Return JSON with keys: recommendations (array of objects with rank, title, id_or_catalog_reference, match_score (0-100), reasons (array), why_this_fits (string), content_notes (array)), profile_signals (array), diversity_note (string). Return at most {req.top_n} recommendations."""
     )
     result["provider"] = "Groq"
     result["model"] = GROQ_MODEL
+    result["retrieval"] = retrieval_stats(req.catalog, retrieved_catalog)
     return result
 
 def split_episode_text(text: str, max_chars: int = 4500):
@@ -103,21 +113,23 @@ def split_episode_text(text: str, max_chars: int = 4500):
 
 
 def summarize_episode_for_continuity(episode_text: str, episode_label: str):
-    """Create compact, grounded episode notes before cross-episode comparison."""
-    chunks = split_episode_text(episode_text)
-    notes = []
-    for index, chunk in enumerate(chunks, start=1):
-        summary = groq_json(
-            "You are preparing factual continuity notes for a script editor. Only report details stated in the supplied transcript. Preserve character names, aliases, relationships, life status, timeline, locations, important objects, injuries, promises, secrets, and unresolved cliffhangers. Do not infer missing facts. Keep the notes compact (roughly 100-150 words).",
-            f"""Episode: {episode_label}
-Transcript segment {index}/{len(chunks)}:
-{chunk}
+    """Retrieve continuity-relevant passages before creating grounded notes."""
+    query = (
+        "continuity character names aliases relationships alive dead status timeline "
+        "locations objects props injuries promises secrets motivations knowledge "
+        "unresolved cliffhanger contradictions"
+    )
+    retrieved = retrieve_top_k(episode_text, query=query)
+    summary = groq_json(
+        "You are preparing factual continuity notes for a script editor. Only report details stated in retrieved transcript passages. Preserve character names, aliases, relationships, life status, timeline, locations, important objects, injuries, promises, secrets, and unresolved cliffhangers. Do not infer missing facts. Mention when retrieved evidence is insufficient.",
+        f"""Episode: {episode_label}
+Retrieved transcript passages (top-K):
+{retrieved}
 
 Return JSON with keys: segment_summary, characters (array of objects with name, alias_or_relationship, status_or_actions), timeline, locations, important_props, established_facts, unresolved_threads, exact_quotes (up to 3 short quotes).""",
-            max_tokens=650,
-        )
-        notes.append({"segment": index, "notes": summary})
-    return notes
+        max_tokens=650,
+    )
+    return [{"segment": 1, "notes": summary, "retrieval": retrieval_stats(episode_text, retrieved)}]
 
 
 def ai_story_review(show_name: str, previous_episode: str, next_episode: str):
