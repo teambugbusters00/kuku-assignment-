@@ -10,6 +10,8 @@ import time
 from functools import lru_cache
 from groq import Groq
 from api.rag import retrieve_top_k, retrieval_stats
+from api.providers import generate_json, provider_status
+from api.manual import ps1_baseline, ps2_baseline
 
 app = FastAPI(title="StoryBridge API", version="1.0.0")
 
@@ -62,7 +64,7 @@ class RecommendationRequest(BaseModel):
 
 @app.get("/api/ai-status")
 def ai_status():
-    return {"provider":"Groq","configured":bool(os.getenv("GROQ_API_KEY")),"model":GROQ_MODEL,"ps1":"Groq","ps2":"Groq","ps3":"Groq","tts_provider":"Groq","tts_model":os.getenv("GROQ_TTS_MODEL","canopylabs/orpheus-v1-english")}
+    return {**provider_status(),"provider":"Hybrid","configured":bool(os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY")),"groq_model":GROQ_MODEL,"tts_provider":"Groq","tts_model":os.getenv("GROQ_TTS_MODEL","canopylabs/orpheus-v1-english")}
 
 @app.post("/api/ps1/tag")
 def ps1_tag(req: TagRequest):
@@ -71,18 +73,22 @@ def ps1_tag(req: TagRequest):
         req.text,
         query=f"episode title {req.title} language {req.language} metadata genre themes characters emotions content warnings summary",
     )
-    result = groq_json(
-        "You are an audio-content metadata analyst. Extract grounded metadata from the retrieved transcript passages only. Do not invent facts. Use concise tags. If evidence is insufficient, say so.",
-        f"""Analyze this episode using the retrieved transcript passages.
+    try:
+        result, provider, model = generate_json(
+            "PS1",
+            "You are an audio-content metadata analyst. Extract grounded metadata from retrieved transcript passages only. Do not invent facts. Use concise tags. If evidence is insufficient, say so.",
+            f"""Analyze this episode using the retrieved transcript passages.
 Title: {req.title}
 Language hint: {req.language}
 Retrieved passages (top-K):
 {retrieved}
 
-Return JSON with keys: title, summary (2-4 sentences), genre (array), tags (array of 5-15), themes (array), characters (array of objects with name and role_or_evidence), emotions (array), content_warnings (array), language, confidence (0-1), evidence_notes (array)."""
-    )
-    result["provider"] = "Groq"
-    result["model"] = GROQ_MODEL
+Return JSON with keys: title, summary (2-4 sentences), genre (array), tags (array of 5-15), themes (array), characters (array of objects with name and role_or_evidence), emotions (array), content_warnings (array), language, confidence (0-1), evidence_notes (array).""",
+            max_tokens=650,
+        )
+        result.update({"provider": provider, "model": model, "analysis_mode": "ai"})
+    except HTTPException:
+        result = ps1_baseline(req.text, req.title, req.language)
     result["retrieval"] = retrieval_stats(req.text, retrieved)
     return result
 
@@ -90,18 +96,22 @@ Return JSON with keys: title, summary (2-4 sentences), genre (array), tags (arra
 def ps2_recommend(req: RecommendationRequest):
     # Each catalog line is a retrieval unit; only profile-relevant entries go to Groq.
     retrieved_catalog = retrieve_top_k(req.catalog, query=req.user_profile)
-    result = groq_json(
-        "You are a personalized audio-story recommendation engine. Recommend only items from the retrieved catalog passages. Never fabricate catalog titles or IDs. Explain relevance using profile signals. Return fewer recommendations if fewer suitable entries are retrieved.",
-        f"""User/listener profile:
+    try:
+        result, provider, model = generate_json(
+            "PS2",
+            "You are a personalized audio-story recommendation engine. Recommend only items from the retrieved catalog passages. Never fabricate catalog titles or IDs. Explain relevance using profile signals. Return fewer recommendations if fewer suitable entries are retrieved.",
+            f"""User/listener profile:
 {req.user_profile}
 
 Retrieved catalog entries (top-K only; preserve exact titles and IDs):
 {retrieved_catalog}
 
-Return JSON with keys: recommendations (array of objects with rank, title, id_or_catalog_reference, match_score (0-100), reasons (array), why_this_fits (string), content_notes (array)), profile_signals (array), diversity_note (string). Return at most {req.top_n} recommendations."""
-    )
-    result["provider"] = "Groq"
-    result["model"] = GROQ_MODEL
+Return JSON with keys: recommendations (array of objects with rank, title, id_or_catalog_reference, match_score (0-100), reasons (array), why_this_fits (string), content_notes (array)). Return at most {req.top_n} recommendations.""",
+            max_tokens=700,
+        )
+        result.update({"provider": provider, "model": model, "analysis_mode": "ai"})
+    except HTTPException:
+        result = ps2_baseline(req.user_profile, retrieved_catalog, req.top_n)
     result["retrieval"] = retrieval_stats(req.catalog, retrieved_catalog)
     return result
 
@@ -146,30 +156,37 @@ Return JSON with keys: segment_summary, characters (array of objects with name, 
 
 
 def summarize_episode_for_continuity(episode_text: str, episode_label: str):
-    # Cache by transcript so adjacent full-series pairs do not summarize the same
-    # episode repeatedly. Labels are added only to the comparison prompt.
-    return _cached_episode_continuity_notes(episode_text)
+    """Prepare bounded evidence locally; no provider call per episode."""
+    query = (
+        "continuity character names aliases relationships alive dead status timeline "
+        "locations objects props injuries promises secrets motivations knowledge "
+        "unresolved cliffhanger contradictions"
+    )
+    retrieved = retrieve_top_k(episode_text, query=query, top_k=8, passage_chars=1200)
+    return {"episode": episode_label, "retrieved_passages": retrieved, "retrieval": retrieval_stats(episode_text, retrieved)}
 
 
 def ai_story_review(show_name: str, previous_episode: str, next_episode: str):
-    # A full episode pair can exceed Groq's free-tier 8K TPM single-request ceiling.
-    # Summarize bounded chunks first, then compare the compact notes.
-    previous_notes = summarize_episode_for_continuity(previous_episode, "Previous episode")
-    next_notes = summarize_episode_for_continuity(next_episode, "Next episode")
-    return groq_json(
-        "You are a careful microdrama continuity editor. Compare compact, transcript-grounded notes from two episodes. Identify only plausible continuity issues supported by the notes. Distinguish explicit contradictions from unresolved questions and intentional cliffhangers. Do not invent details; human verification against original transcripts is required.",
+    previous = summarize_episode_for_continuity(previous_episode, "Previous episode")
+    following = summarize_episode_for_continuity(next_episode, "Next episode")
+    result, provider, model = generate_json(
+        "PS3",
+        "You are a careful microdrama continuity editor. Compare evidence from two episodes. Identify only plausible continuity issues supported by the supplied passages. Distinguish explicit contradictions from unresolved questions and intentional cliffhangers. Do not invent details. Return concise, structured JSON.",
         f"""Show: {show_name}
 
-PREVIOUS EPISODE NOTES (summaries of all transcript segments):
-{json.dumps(previous_notes, ensure_ascii=False)}
+PREVIOUS EPISODE RETRIEVED EVIDENCE:
+{previous["retrieved_passages"]}
 
-NEXT EPISODE NOTES (summaries of all transcript segments):
-{json.dumps(next_notes, ensure_ascii=False)}
+NEXT EPISODE RETRIEVED EVIDENCE:
+{following["retrieved_passages"]}
 
-Return JSON with keys: summary (object with overall_assessment, risk_level, flags), findings (array of objects with severity [high/review/info], category, title, evidence (quote/paraphrase from each episode), explanation, recommendation, confidence 0-1), recurring_characters (array), unresolved_threads (array), continuity_checklist (array), limitations (array). Be explicit that evidence comes from chunk summaries and may need checking against the source transcript.""",
-        max_tokens=700,
+Return JSON with keys: summary (object with overall_assessment, risk_level, flags), findings (array of objects with severity [high/review/info], category, title, evidence (quote/paraphrase from each episode), explanation, recommendation, confidence 0-1), recurring_characters (array), unresolved_threads (array), continuity_checklist (array), limitations (array). Keep each finding concise.""",
+        max_tokens=850,
     )
-
+    result["_provider"] = provider
+    result["_model"] = model
+    result["_retrieval"] = {"previous": previous["retrieval"], "next": following["retrieval"]}
+    return result
 
 
 
@@ -261,7 +278,12 @@ def heuristic_analyze(req):
 
 def analyze(req):
     """Run PS3 continuity analysis with Groq only; never silently downgrade to rules."""
-    ai = ai_story_review(req.show_name, req.previous_episode, req.next_episode)
+    try:
+        ai = ai_story_review(req.show_name, req.previous_episode, req.next_episode)
+    except HTTPException:
+        baseline = heuristic_analyze(req)
+        baseline.update({"analysis_provider":"Local baseline","analysis_model":"rules-v1","fallback_used":True,"analysis_mode":"baseline"})
+        return baseline
     if not isinstance(ai, dict):
         raise HTTPException(status_code=502, detail="Groq returned an invalid continuity-review payload.")
 
@@ -287,8 +309,9 @@ def analyze(req):
         "review_checklist": checklist or ["Check chronology and time jumps","Verify aliases, character relationships, and motivations","Check props, injuries, settings, and character knowledge","Review cliffhangers and intentional reveals","Validate each finding against source text"],
         "recurring_characters": recurring,
         "unresolved_threads": unresolved,
-        "analysis_provider": "Groq",
-        "analysis_model": GROQ_MODEL,
+        "analysis_provider": ai.get("_provider", "AI"),
+        "analysis_model": ai.get("_model", "configured-model"),
+        "retrieval": ai.get("_retrieval", {}),
         "fallback_used": False,
         "limitations": ["Groq can miss or misinterpret details; human review is required.","Aliases and nicknames may still be missed or merged.","Flags are review prompts, not factual conclusions.","Text-only: no video, audio, or visual evidence.","Multilingual quality depends on model coverage and is not independently benchmarked.","No findings does not prove continuity correctness."]
     }
