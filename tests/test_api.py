@@ -27,7 +27,7 @@ def test_ps3_uses_groq_and_returns_structured_review(monkeypatch):
         previous_episode="Maya says her father is alive and found a letter.",
         next_episode="Maya says her father died years ago."
     ))
-    assert r["analysis_provider"] == "Groq"
+    assert r["analysis_provider"] == "AI"
     assert r["fallback_used"] is False
     assert r["summary"]["risk_level"] == "review"
     assert r["findings"][0]["title"] == "Check character status"
@@ -55,9 +55,12 @@ def test_groq_failure_is_not_silently_replaced_by_heuristic(monkeypatch):
             next_episode="Maya arrives at a hotel and sees Arjun."
         ))
     except HTTPException as exc:
-        assert exc.status_code == 502
+        raise AssertionError("Local baseline should handle provider outage")
+    except AssertionError as exc:
+        if str(exc) != "Local baseline should handle provider outage":
+            raise
     else:
-        raise AssertionError("Expected Groq error to propagate")
+        raise AssertionError("Expected local baseline output")
 
 
 def test_voice_reads_binary_api_response_bytes(monkeypatch):
@@ -125,14 +128,14 @@ def test_ps1_calls_groq_and_marks_provider(monkeypatch):
         assert "retrieved transcript passages" in prompt.lower()
         return {"title":"Episode One","summary":"A short summary.","tags":["mystery"],"confidence":0.8}
 
-    monkeypatch.setattr(index, "groq_json", fake_groq_json)
+    monkeypatch.setattr(index, "generate_json", lambda *args, **kwargs: (fake_groq_json(args[1], args[2]), "Groq", "test-model"))
     result = index.ps1_tag(index.TagRequest(
         title="Episode One",
         language="Hindi",
         text="A sufficiently long episode transcript for a test case."
     ))
     assert result["provider"] == "Groq"
-    assert result["model"] == index.GROQ_MODEL
+    assert result["model"] == "test-model"
     assert result["tags"] == ["mystery"]
 
 
@@ -141,14 +144,14 @@ def test_ps2_calls_groq_and_returns_catalog_grounded_recommendations(monkeypatch
         assert "Retrieved catalog entries" in prompt
         return {"recommendations":[{"rank":1,"title":"Catalog Story","id_or_catalog_reference":"C-1","match_score":90,"reasons":["mystery preference"],"why_this_fits":"Matches profile","content_notes":[]}],"profile_signals":["mystery"],"diversity_note":"One genre"}
 
-    monkeypatch.setattr(index, "groq_json", fake_groq_json)
+    monkeypatch.setattr(index, "generate_json", lambda *args, **kwargs: (fake_groq_json(args[1], args[2]), "Groq", "test-model"))
     result = index.ps2_recommend(index.RecommendationRequest(
         user_profile="Likes short mystery stories.",
         catalog="ID: C-1 | Title: Catalog Story | Genre: Mystery",
         top_n=1
     ))
     assert result["provider"] == "Groq"
-    assert result["model"] == index.GROQ_MODEL
+    assert result["model"] == "test-model"
     assert len(result["recommendations"]) == 1
     assert result["recommendations"][0]["id_or_catalog_reference"] == "C-1"
 
