@@ -51,7 +51,7 @@ def ps2_baseline(profile: str, catalog: str, top_n: int) -> dict:
         score = round(100 * overlap / max(1, len(profile_terms)))
         title_match = re.search(r"title\s*:\s*([^|]+)", line, re.I)
         id_match = re.search(r"(?:id|catalog(?:_reference)?)\s*:\s*([^|]+)", line, re.I)
-        scored.append((overlap, {
+        scored.append((overlap, index, {
             "rank": 0,
             "title": title_match.group(1).strip() if title_match else f"Catalog item {index + 1}",
             "id_or_catalog_reference": id_match.group(1).strip() if id_match else str(index + 1),
@@ -60,8 +60,8 @@ def ps2_baseline(profile: str, catalog: str, top_n: int) -> dict:
             "why_this_fits": "Ranked by lexical overlap between the profile and this catalog entry.",
             "content_notes": [],
         }))
-    selected = sorted(scored, key=lambda item: (-item[0], entries.index(next(e for e in entries if e in e))))[:top_n]
-    recs = [item[1] for item in selected]
+    selected = sorted(scored, key=lambda item: (-item[0], item[1]))[:top_n]
+    recs = [item[2] for item in selected]
     for rank, item in enumerate(recs, 1):
         item["rank"] = rank
     return {
