@@ -44,23 +44,18 @@ def test_report_includes_checklist_and_limitations(monkeypatch):
     assert r["limitations"]
 
 
-def test_groq_failure_is_not_silently_replaced_by_heuristic(monkeypatch):
+def test_provider_failure_uses_local_continuity_baseline(monkeypatch):
     def fail(*args):
-        raise HTTPException(status_code=502, detail="Groq unavailable")
+        raise HTTPException(status_code=503, detail="AI providers unavailable")
 
     monkeypatch.setattr(index, "ai_story_review", fail)
-    try:
-        index.analyze(index.Request(
-            previous_episode="Maya enters the hospital and sees Arjun.",
-            next_episode="Maya arrives at a hotel and sees Arjun."
-        ))
-    except HTTPException as exc:
-        raise AssertionError("Local baseline should handle provider outage")
-    except AssertionError as exc:
-        if str(exc) != "Local baseline should handle provider outage":
-            raise
-    else:
-        raise AssertionError("Expected local baseline output")
+    result = index.analyze(index.Request(
+        previous_episode="Maya enters the hospital and sees Arjun.",
+        next_episode="Maya arrives at a hotel and sees Arjun."
+    ))
+    assert result["analysis_provider"] == "Local baseline"
+    assert result["fallback_used"] is True
+    assert result["analysis_mode"] == "baseline"
 
 
 def test_voice_reads_binary_api_response_bytes(monkeypatch):
