@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import os
 import json
+import time
+from functools import lru_cache
 from groq import Groq
 from api.rag import retrieve_top_k, retrieval_stats
 
@@ -19,24 +21,34 @@ def groq_client():
         raise HTTPException(status_code=503, detail="Groq is not configured. Add GROQ_API_KEY in Render environment variables.")
     return Groq(api_key=key)
 
-def groq_json(system_prompt: str, user_prompt: str, max_tokens: int = 1200):
-    try:
-        response = groq_client().chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt + " Return ONLY valid JSON. No markdown fences."},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.2,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content or "{}"
-        return json.loads(content)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq request failed: {str(exc)[:500]}")
+def groq_json(system_prompt: str, user_prompt: str, max_tokens: int = 700):
+    # Keep output budgets bounded and retry one OTPM 429 after Groq's suggested wait.
+    for attempt in range(2):
+        try:
+            response = groq_client().chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt + " Return ONLY valid JSON. No markdown fences."},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content or "{}"
+            return json.loads(content)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            message = str(exc)
+            is_rate_limit = "429" in message or "rate_limit_exceeded" in message
+            if is_rate_limit and attempt == 0:
+                match = re.search(r"try again in ([0-9.]+)s", message, re.IGNORECASE)
+                wait_seconds = min(30.0, max(2.0, float(match.group(1)) + 1.0)) if match else 15.0
+                time.sleep(wait_seconds)
+                continue
+            status = 429 if is_rate_limit else 502
+            raise HTTPException(status_code=status, detail=f"Groq request failed: {message[:500]}")
 
 class TagRequest(BaseModel):
     text: str = Field(min_length=20, max_length=30000)
@@ -112,7 +124,8 @@ def split_episode_text(text: str, max_chars: int = 4500):
     return chunks
 
 
-def summarize_episode_for_continuity(episode_text: str, episode_label: str):
+@lru_cache(maxsize=64)
+def _cached_episode_continuity_notes(episode_text: str):
     """Retrieve continuity-relevant passages before creating grounded notes."""
     query = (
         "continuity character names aliases relationships alive dead status timeline "
@@ -122,14 +135,20 @@ def summarize_episode_for_continuity(episode_text: str, episode_label: str):
     retrieved = retrieve_top_k(episode_text, query=query)
     summary = groq_json(
         "You are preparing factual continuity notes for a script editor. Only report details stated in retrieved transcript passages. Preserve character names, aliases, relationships, life status, timeline, locations, important objects, injuries, promises, secrets, and unresolved cliffhangers. Do not infer missing facts. Mention when retrieved evidence is insufficient.",
-        f"""Episode: {episode_label}
+        f"""Episode transcript
 Retrieved transcript passages (top-K):
 {retrieved}
 
 Return JSON with keys: segment_summary, characters (array of objects with name, alias_or_relationship, status_or_actions), timeline, locations, important_props, established_facts, unresolved_threads, exact_quotes (up to 3 short quotes).""",
-        max_tokens=650,
+        max_tokens=280,
     )
     return [{"segment": 1, "notes": summary, "retrieval": retrieval_stats(episode_text, retrieved)}]
+
+
+def summarize_episode_for_continuity(episode_text: str, episode_label: str):
+    # Cache by transcript so adjacent full-series pairs do not summarize the same
+    # episode repeatedly. Labels are added only to the comparison prompt.
+    return _cached_episode_continuity_notes(episode_text)
 
 
 def ai_story_review(show_name: str, previous_episode: str, next_episode: str):
@@ -148,7 +167,7 @@ NEXT EPISODE NOTES (summaries of all transcript segments):
 {json.dumps(next_notes, ensure_ascii=False)}
 
 Return JSON with keys: summary (object with overall_assessment, risk_level, flags), findings (array of objects with severity [high/review/info], category, title, evidence (quote/paraphrase from each episode), explanation, recommendation, confidence 0-1), recurring_characters (array), unresolved_threads (array), continuity_checklist (array), limitations (array). Be explicit that evidence comes from chunk summaries and may need checking against the source transcript.""",
-        max_tokens=1600,
+        max_tokens=700,
     )
 
 
